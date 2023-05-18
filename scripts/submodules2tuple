@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+
+set -e
+
+show_help() {
+  echo "Usage: submodules2tuples [OPTIONS] repository_url"
+  echo "Options:"
+  echo "  -h                Show help text"
+  echo "  -b <branch|tag>   Specify a branch or tag to use (e.g. v0.2.105)"
+  echo "  -v                Verbose output"
+  echo "  -s                Silent output"
+  echo
+}
+
+get_account_and_project() {
+  local repository_url=$1
+  local account
+  local project
+
+  account=$(echo "$repository_url" | sed -n 's/.*github.com\/\([^/]*\)\/.*/\1/p')
+  project=$(echo "$repository_url" | sed -n 's/.*github.com\/[^/]*\/\([^/]*\).*/\1/p')
+
+  echo "$account:$project"
+}
+
+tmpdir=$(mktemp -d)
+
+while getopts ":hb:vs" opt; do
+  case $opt in
+  h)
+    show_help
+    exit 0
+    ;;
+  b)
+    readonly branch=$OPTARG
+    ;;
+  v)
+    readonly verbose_mode=true
+    ;;
+  s)
+    readonly silent_mode=true
+    ;;
+  \?)
+    echo "Invalid option: -$OPTARG" >&2
+    show_help
+    exit 1
+    ;;
+  esac
+done
+
+shift $((OPTIND - 1))
+
+repository=$1
+
+if [[ -z $repository ]]; then
+  echo "Error: Repository URL is required."
+  show_help
+  exit 1
+fi
+
+echo_progress() {
+  if [ "$silent_mode" != true ]; then
+    echo "$1"
+  fi
+}
+
+account_and_project=$(get_account_and_project "${repository%.git}")
+account=${account_and_project%:*}
+project=${account_and_project#*:}
+
+echo_progress "===> Cloning repositories"
+
+clone_output='> /dev/null 2>&1'
+if [[ $verbose_mode == true ]]; then
+  clone_output=''
+fi
+
+if [[ -n $branch ]]; then
+  eval git clone --branch "$branch" --single-branch --recurse-submodules "$repository" "$tmpdir" $clone_output
+else
+  eval git clone --recurse-submodules --single-branch "$repository" "$tmpdir" $clone_output
+fi
+
+echo_progress "===> Analyzing submodules"
+tuples=()
+
+analyze_submodule() {
+  local submodule_dir="$1"
+  local submodule_path="$2"
+
+  while read -r hash path bracket; do
+    remote=$(git -C "${submodule_dir}/${path}" remote get-url origin)
+    remote="${remote%.git}"
+
+    mod_account_and_project=$(get_account_and_project "$remote")
+    mod_account=${mod_account_and_project%:*}
+    mod_project=${mod_account_and_project#*:}
+    group="${mod_project//[^[:alnum:]_]/}"
+
+    shorthash=$(git -C "$submodule_dir" rev-parse --short "$hash")
+
+    # Replace multiple "//" with a single "/"
+    tuple_string="${mod_account}:${mod_project}:${shorthash}:${group,,}/${submodule_path}/${path}"
+    sanitized_tuple_string=${tuple_string//\/\//\/}
+    tuples+=("${sanitized_tuple_string}")
+
+    # Recursively analyze submodules within this submodule
+    analyze_submodule "${submodule_dir}/${path}" "${submodule_path}/${path}"
+  done < <(git -C "$submodule_dir" submodule)
+}
+
+# Analyze submodules
+analyze_submodule "$tmpdir" ""
+
+if [ ${#tuples[@]} -eq 0 ]; then
+  echo_progress "===> No tuples found"
+else
+  length=${#tuples[@]}
+  if [[ $length -gt 1 ]]; then
+    echo_progress "===> $length tuples found"
+  else
+    echo_progress "===> $length tuple found"
+  fi
+  echo_progress
+  for ((i = 0; i < $length; i++)); do
+    tuple="${tuples[i]}"
+    if [[ $i -eq 0 ]]; then
+      if [[ $length -eq 1 ]]; then
+        echo -e "GH_TUPLE=\t$tuple"
+      else
+        echo -e "GH_TUPLE=\t$tuple \\"
+      fi
+    elif [[ $i -eq $((length - 1)) ]]; then
+      echo -e "\t\t$tuple"
+    else
+      echo -e "\t\t$tuple \\"
+    fi
+  done
+fi
+
+echo_progress
+
+rm -rf "$tmpdir"
